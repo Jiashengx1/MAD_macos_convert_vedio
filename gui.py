@@ -274,10 +274,7 @@ class ConverterApp:
             for source in files:
                 self._check_cancelled()
                 try:
-                    info = converter.MediaInfo(
-                        path=source,
-                        probe=converter.run_probe(ffprobe, source),
-                    )
+                    info = converter.probe_media(ffprobe, source)
                 except RuntimeError as exc:
                     self._put_log(f"跳过：{source}\n原因：{exc}")
                     continue
@@ -347,6 +344,8 @@ class ConverterApp:
             audio_bitrate=DEFAULT_AUDIO_BITRATE,
             overwrite=overwrite,
             has_audio=info.audio is not None,
+            input_skip_bytes=info.input_skip_bytes,
+            use_unskipped_audio=info.use_unskipped_audio,
             progress=True,
         )
         process = subprocess.Popen(
