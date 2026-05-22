@@ -158,7 +158,7 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
 class ConverterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("macOS 视频转换器")
+        self.root.title("医务科监控视频转换器")
         self.root.geometry("840x620")
         self.root.minsize(780, 560)
 
