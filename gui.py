@@ -10,6 +10,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from types import SimpleNamespace
 from typing import Any
 
 import main as converter
@@ -17,7 +18,36 @@ import main as converter
 
 DEFAULT_CRF = 23
 DEFAULT_PRESET = "veryfast"
-DEFAULT_AUDIO_BITRATE = "96k"
+DEFAULT_AUDIO_BITRATE = converter.DEFAULT_AUDIO_BITRATE
+DEFAULT_HARDWARE_QUALITY = converter.DEFAULT_HARDWARE_QUALITY
+DEFAULT_VIDEO_ENCODER = converter.HARDWARE_VIDEO_ENCODER
+ENCODER_LABELS = {
+    converter.HARDWARE_VIDEO_ENCODER: "h264_videotoolbox (macOS 硬件)",
+    converter.SOFTWARE_VIDEO_ENCODER: "libx264 (CPU)",
+}
+ENCODER_VALUES = tuple(ENCODER_LABELS)
+ENCODER_LABEL_OPTIONS = tuple(ENCODER_LABELS.values())
+PRESET_OPTIONS = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+)
+AUDIO_BITRATE_OPTIONS = ("16k", "24k", "32k", "48k", "64k", "96k", "128k")
+
+
+def encoder_label(value: str) -> str:
+    return ENCODER_LABELS.get(value, value)
+
+
+def encoder_value(label: str) -> str:
+    for value, display in ENCODER_LABELS.items():
+        if label == display or label == value:
+            return value
+    return label
 
 
 class CancelledConversion(Exception):
@@ -129,12 +159,18 @@ class ConverterApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("macOS 视频转换器")
-        self.root.geometry("760x520")
-        self.root.minsize(680, 460)
+        self.root.geometry("840x620")
+        self.root.minsize(780, 560)
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.overwrite_var = tk.BooleanVar(value=False)
+        self.video_encoder_var = tk.StringVar(value=encoder_label(DEFAULT_VIDEO_ENCODER))
+        self.hardware_quality_var = tk.StringVar(value=str(DEFAULT_HARDWARE_QUALITY))
+        self.video_bitrate_var = tk.StringVar()
+        self.crf_var = tk.StringVar(value=str(DEFAULT_CRF))
+        self.preset_var = tk.StringVar(value=DEFAULT_PRESET)
+        self.audio_bitrate_var = tk.StringVar(value=DEFAULT_AUDIO_BITRATE)
         self.status_var = tk.StringVar(value="就绪")
         self.progress_var = tk.DoubleVar(value=0.0)
 
@@ -149,7 +185,7 @@ class ConverterApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(4, weight=1)
 
         form = ttk.Frame(self.root, padding=(16, 16, 16, 8))
         form.grid(row=0, column=0, sticky="ew")
@@ -182,8 +218,81 @@ class ConverterApp:
             variable=self.overwrite_var,
         ).pack(side="left")
 
+        params = ttk.LabelFrame(self.root, text="转换参数", padding=(12, 8, 12, 10))
+        params.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        params.columnconfigure(1, weight=1)
+
+        ttk.Label(params, text="编码器").grid(row=0, column=0, sticky="w")
+        encoder_select = ttk.Combobox(
+            params,
+            textvariable=self.video_encoder_var,
+            values=ENCODER_LABEL_OPTIONS,
+            state="readonly",
+            width=28,
+        )
+        encoder_select.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        encoder_select.bind("<<ComboboxSelected>>", self._update_encoder_panel)
+
+        self.hardware_frame = ttk.Frame(params)
+        self.hardware_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        for column in (1, 3):
+            self.hardware_frame.columnconfigure(column, weight=1)
+
+        ttk.Label(self.hardware_frame, text="硬件质量").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(
+            self.hardware_frame,
+            from_=0,
+            to=100,
+            textvariable=self.hardware_quality_var,
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 16))
+
+        ttk.Label(self.hardware_frame, text="视频码率").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            self.hardware_frame,
+            textvariable=self.video_bitrate_var,
+            width=12,
+        ).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        self.software_frame = ttk.Frame(params)
+        self.software_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        for column in (1, 3):
+            self.software_frame.columnconfigure(column, weight=1)
+
+        ttk.Label(self.software_frame, text="CRF").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(
+            self.software_frame,
+            from_=0,
+            to=51,
+            textvariable=self.crf_var,
+            width=8,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 16))
+
+        ttk.Label(self.software_frame, text="Preset").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            self.software_frame,
+            textvariable=self.preset_var,
+            values=PRESET_OPTIONS,
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        common_params = ttk.Frame(params)
+        common_params.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        common_params.columnconfigure(1, weight=1)
+
+        ttk.Label(common_params, text="音频码率").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            common_params,
+            textvariable=self.audio_bitrate_var,
+            values=AUDIO_BITRATE_OPTIONS,
+            width=12,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self._update_encoder_panel()
+
         controls = ttk.Frame(self.root, padding=(16, 0, 16, 8))
-        controls.grid(row=2, column=0, sticky="ew")
+        controls.grid(row=3, column=0, sticky="ew")
         controls.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(
             controls,
@@ -203,7 +312,7 @@ class ConverterApp:
         self.cancel_button.grid(row=0, column=2, padx=(8, 0))
 
         log_frame = ttk.Frame(self.root, padding=(16, 0, 16, 12))
-        log_frame.grid(row=3, column=0, sticky="nsew")
+        log_frame.grid(row=4, column=0, sticky="nsew")
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
         self.log = scrolledtext.ScrolledText(log_frame, height=12, wrap="word")
@@ -211,8 +320,17 @@ class ConverterApp:
         self.log.configure(state="disabled")
 
         status = ttk.Frame(self.root, padding=(16, 0, 16, 12))
-        status.grid(row=4, column=0, sticky="ew")
+        status.grid(row=5, column=0, sticky="ew")
         ttk.Label(status, textvariable=self.status_var).pack(side="left")
+
+    def _update_encoder_panel(self, _event: tk.Event | None = None) -> None:
+        video_encoder = encoder_value(self.video_encoder_var.get())
+        if video_encoder == converter.HARDWARE_VIDEO_ENCODER:
+            self.software_frame.grid_remove()
+            self.hardware_frame.grid()
+        else:
+            self.hardware_frame.grid_remove()
+            self.software_frame.grid()
 
     def _choose_input_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -255,6 +373,11 @@ class ConverterApp:
         output_dir = Path(output_text).expanduser().resolve() if output_text else (
             input_path.parent if input_path.is_file() else input_path
         )
+        try:
+            settings = self._read_settings()
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
 
         self.cancel_event.clear()
         self.progress_var.set(0)
@@ -262,7 +385,7 @@ class ConverterApp:
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._worker,
-            args=(input_path, output_dir, self.overwrite_var.get()),
+            args=(input_path, output_dir, self.overwrite_var.get(), settings),
             daemon=True,
         )
         self.worker.start()
@@ -274,43 +397,65 @@ class ConverterApp:
         if process is not None:
             terminate_process(process)
 
-    def _worker(self, input_path: Path, output_dir: Path, overwrite: bool) -> None:
+    def _worker(
+        self,
+        input_path: Path,
+        output_dir: Path,
+        overwrite: bool,
+        settings: SimpleNamespace,
+    ) -> None:
         try:
             ffmpeg = find_tool("ffmpeg")
             ffprobe = find_tool("ffprobe")
+            hardware_available = False
+            if settings.video_encoder == converter.HARDWARE_VIDEO_ENCODER:
+                hardware_available = converter.h264_videotoolbox_available(ffmpeg)
+                if hardware_available:
+                    self._put_log("硬件编码可用：h264_videotoolbox")
+                else:
+                    self._put_log(
+                        "硬件编码预检测失败，仍会尝试 h264_videotoolbox；失败后回退 libx264。"
+                    )
+            else:
+                self._put_log("编码器：libx264")
+
             output_dir.mkdir(parents=True, exist_ok=True)
             files = collect_media_files(input_path, output_dir)
             self._put_log(f"扫描到 {len(files)} 个媒体文件。")
+            self._put_log("正在并行分析媒体信息...")
 
-            candidates: list[tuple[Path, Path, converter.MediaInfo, float]] = []
-            for source in files:
+            candidates: list[
+                tuple[Path, Path, converter.MediaInfo, converter.ConversionPlan, float]
+            ] = []
+            for result in converter.probe_media_files(ffprobe, files):
                 self._check_cancelled()
-                try:
-                    info = converter.probe_media(ffprobe, source)
-                except RuntimeError as exc:
-                    self._put_log(f"跳过：{source}\n原因：{exc}")
+                source = result.path
+                if result.error is not None or result.info is None:
+                    self._put_log(f"跳过：{source}\n原因：{result.error}")
                     continue
+                info = result.info
 
                 self._put_log(f"识别：{source}\n{info.summary()}")
-                if not info.needs_conversion:
-                    self._put_log("跳过：容器和时间戳看起来不需要转换。")
-                    continue
                 if not info.has_valid_video:
                     self._put_log("跳过：无法识别有效视频尺寸，文件可能损坏。")
+                    continue
+                plan = converter.choose_conversion_plan(info)
+                if plan is None:
+                    self._put_log("跳过：容器和时间戳看起来不需要转换。")
                     continue
 
                 target = output_path_for(source, input_path, output_dir)
                 if target.exists() and not overwrite:
                     self._put_log(f"跳过：输出已存在：{target}")
                     continue
-                candidates.append((source, target, info, media_duration(info)))
+                candidates.append((source, target, info, plan, media_duration(info)))
 
             if not candidates:
                 self.messages.put(("done", "没有需要转换的文件。"))
                 return
 
             total = len(candidates)
-            for index, (source, target, info, duration) in enumerate(candidates):
+            for index, (source, target, info, plan, duration) in enumerate(candidates):
                 self._check_cancelled()
                 self._convert_one(
                     ffmpeg=ffmpeg,
@@ -318,10 +463,13 @@ class ConverterApp:
                     source=source,
                     target=target,
                     info=info,
+                    plan=plan,
                     duration=duration,
                     file_index=index,
                     total=total,
                     overwrite=overwrite,
+                    hardware_available=hardware_available,
+                    settings=settings,
                 )
 
             self.messages.put(("progress", 100.0, "完成"))
@@ -340,37 +488,136 @@ class ConverterApp:
         source: Path,
         target: Path,
         info: converter.MediaInfo,
+        plan: converter.ConversionPlan,
         duration: float,
         file_index: int,
         total: int,
         overwrite: bool,
+        hardware_available: bool,
+        settings: SimpleNamespace,
     ) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
-        self._put_log(f"开始转换：{source}\n输出：{target}")
-        cmd = converter.build_ffmpeg_command(
-            ffmpeg=ffmpeg,
-            source=source,
-            target=target,
-            crf=DEFAULT_CRF,
-            preset=DEFAULT_PRESET,
-            audio_bitrate=DEFAULT_AUDIO_BITRATE,
-            overwrite=overwrite,
-            has_audio=info.audio is not None,
-            input_skip_bytes=info.input_skip_bytes,
-            use_unskipped_audio=info.use_unskipped_audio,
-            progress=True,
+        self._put_log(
+            f"开始转换：{source}\n输出：{target}\n方案：{plan.name}（{plan.reason}）"
         )
-        return_code = self._run_ffmpeg_process(
-            cmd=cmd,
-            duration=duration,
-            file_index=file_index,
-            total=total,
-            target=target,
-        )
-        if return_code != 0:
+        args = self._conversion_args(settings)
+        encoders = converter.encoder_attempts(settings.video_encoder, hardware_available)
+
+        if plan.mode in {"copy", "copy_video_transcode_audio"}:
+            cmd = converter.build_copy_command(
+                ffmpeg=ffmpeg,
+                source=source,
+                target=target,
+                info=info,
+                args=args,
+                transcode_audio=plan.mode == "copy_video_transcode_audio",
+                overwrite=overwrite,
+                progress=True,
+            )
+            return_code = self._run_ffmpeg_process(
+                cmd=cmd,
+                duration=duration,
+                file_index=file_index,
+                total=total,
+                target=target,
+            )
+            if return_code == 0:
+                verify = converter.validate_output(ffprobe, target)
+                self._put_log(f"已验证：{verify}")
+                return
+            if self.cancel_event.is_set():
+                raise CancelledConversion()
+            self._put_log(f"{plan.name} 失败，改用完整转码。")
+            converter.remove_partial_output(target)
+
+        for index, video_encoder in enumerate(encoders):
+            self._check_cancelled()
+            encoder_name = converter.describe_video_encoder(video_encoder)
+            self._put_log(f"编码器：{encoder_name}")
+            cmd = converter.build_full_transcode_command(
+                ffmpeg=ffmpeg,
+                source=source,
+                target=target,
+                info=info,
+                args=args,
+                video_encoder=video_encoder,
+                overwrite=overwrite or index > 0 or plan.mode != "full_transcode",
+                progress=True,
+            )
+            return_code = self._run_ffmpeg_process(
+                cmd=cmd,
+                duration=duration,
+                file_index=file_index,
+                total=total,
+                target=target,
+            )
+            if return_code == 0:
+                verify = converter.validate_output(ffprobe, target)
+                self._put_log(f"已验证：{verify}")
+                return
+            if self.cancel_event.is_set():
+                raise CancelledConversion()
+            self._put_log(f"{encoder_name} 失败，退出码：{return_code}")
+            if index < len(encoders) - 1:
+                self._put_log("改用 libx264 CPU 编码重试。")
+                continue
             raise RuntimeError(f"ffmpeg 转换失败，退出码：{return_code}")
-        verify = converter.validate_output(ffprobe, target)
-        self._put_log(f"已验证：{verify}")
+
+    def _read_settings(self) -> SimpleNamespace:
+        video_encoder = encoder_value(self.video_encoder_var.get().strip())
+        if video_encoder not in ENCODER_VALUES:
+            raise ValueError("编码器参数无效。")
+
+        crf = DEFAULT_CRF
+        preset = DEFAULT_PRESET
+        hardware_quality = DEFAULT_HARDWARE_QUALITY
+        video_bitrate = None
+
+        if video_encoder == converter.HARDWARE_VIDEO_ENCODER:
+            hardware_quality = self._read_int(
+                "硬件质量",
+                self.hardware_quality_var.get(),
+                0,
+                100,
+            )
+            video_bitrate = self.video_bitrate_var.get().strip() or None
+        else:
+            crf = self._read_int("CRF", self.crf_var.get(), 0, 51)
+            preset = self.preset_var.get().strip() or DEFAULT_PRESET
+            if preset not in PRESET_OPTIONS:
+                raise ValueError("Preset 参数无效。")
+
+        audio_bitrate = self.audio_bitrate_var.get().strip()
+        if not audio_bitrate:
+            raise ValueError("音频码率不能为空，例如 16k。")
+
+        return SimpleNamespace(
+            video_encoder=video_encoder,
+            crf=crf,
+            preset=preset,
+            hardware_quality=hardware_quality,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
+        )
+
+    def _read_int(self, label: str, value: str, minimum: int, maximum: int) -> int:
+        try:
+            number = int(str(value).strip())
+        except ValueError as exc:
+            raise ValueError(f"{label} 必须是整数。") from exc
+        if number < minimum or number > maximum:
+            raise ValueError(f"{label} 必须在 {minimum} 到 {maximum} 之间。")
+        return number
+
+    def _conversion_args(self, settings: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            crf=settings.crf,
+            preset=settings.preset,
+            audio_bitrate=settings.audio_bitrate,
+            no_faststart=False,
+            hardware_quality=settings.hardware_quality,
+            video_bitrate=settings.video_bitrate,
+        )
 
     def _run_ffmpeg_process(
         self,
