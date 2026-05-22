@@ -22,6 +22,9 @@ MEDIA_EXTENSIONS = {
     ".ts",
 }
 
+OUTPUT_WIDTH = 1920
+OUTPUT_HEIGHT = 1080
+
 
 @dataclass
 class MediaInfo:
@@ -81,6 +84,12 @@ class MediaInfo:
 
     @property
     def needs_conversion(self) -> bool:
+        video = self.video
+        if video and (
+            int(video.get("width") or 0) != OUTPUT_WIDTH
+            or int(video.get("height") or 0) != OUTPUT_HEIGHT
+        ):
+            return True
         if self.path.suffix.lower() == ".mp4" and self.is_mpeg_ps:
             return True
         gap = self.stream_start_gap
@@ -231,6 +240,8 @@ def iter_media_files(root: Path, output_dir: Path) -> list[Path]:
             continue
         if path == Path(__file__).resolve():
             continue
+        if path.stem.endswith("_macos"):
+            continue
         try:
             path.resolve().relative_to(output_dir)
             continue
@@ -261,7 +272,13 @@ def build_ffmpeg_command(
 ) -> list[str]:
     video_input = "1:v:0" if use_unskipped_audio else "0:v:0"
     audio_input = "0:a:0"
-    filters = [f"[{video_input}]setpts=PTS-STARTPTS,format=yuv420p[v]"]
+    video_filter = (
+        f"[{video_input}]setpts=PTS-STARTPTS,"
+        f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,format=yuv420p[v]"
+    )
+    filters = [video_filter]
     maps = ["-map", "[v]"]
 
     if has_audio:

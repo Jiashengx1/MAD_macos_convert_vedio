@@ -21,6 +21,8 @@ python3.12 build_macos_app.py
 
 `.app` 内已包含 Python 运行时、GUI、`ffmpeg` 和 `ffprobe`。把 zip 发给别人，对方解压后双击 `MacVideoConverter.app` 即可。
 
+转换输出固定为标准 MP4：H.264 视频、AAC 音频、1920x1080 画面。
+
 ## macOS 安全提示
 
 这个应用没有 Apple 开发者签名和公证。别人第一次打开时，macOS 可能提示无法验证开发者；可在 Finder 中右键应用，选择“打开”，再确认打开。若要彻底消除该提示，需要 Apple Developer ID 证书并做 notarization。
