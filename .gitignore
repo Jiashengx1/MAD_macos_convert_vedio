@@ -3,3 +3,7 @@ __pycache__
 converted_macos
 .DS_Store
 *.log
+build
+dist
+*.spec
+.pyinstaller-cache

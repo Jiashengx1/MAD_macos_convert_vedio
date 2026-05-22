@@ -27,6 +27,9 @@ MEDIA_EXTENSIONS = {
 class MediaInfo:
     path: Path
     probe: dict[str, Any]
+    input_skip_bytes: int = 0
+    use_unskipped_audio: bool = False
+    unskipped_audio: dict[str, Any] | None = None
 
     @property
     def format_name(self) -> str:
@@ -47,6 +50,8 @@ class MediaInfo:
 
     @property
     def audio(self) -> dict[str, Any] | None:
+        if self.use_unskipped_audio and self.unskipped_audio:
+            return self.unskipped_audio
         return next((s for s in self.streams if s.get("codec_type") == "audio"), None)
 
     @property
@@ -94,6 +99,10 @@ class MediaInfo:
             parts.append(f"size={video.get('width')}x{video.get('height')}")
         if gap is not None:
             parts.append(f"av_start_gap={gap:.3f}s")
+        if self.input_skip_bytes:
+            parts.append(f"skip_initial_bytes={self.input_skip_bytes}")
+        if self.use_unskipped_audio:
+            parts.append("audio_source=unskipped")
         return ", ".join(parts)
 
 
@@ -104,22 +113,26 @@ def require_tool(name: str) -> str:
     return found
 
 
-def run_probe(ffprobe: str, path: Path) -> dict[str, Any]:
+def run_probe(ffprobe: str, path: Path, skip_initial_bytes: int = 0) -> dict[str, Any]:
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-analyzeduration",
+        "100M",
+        "-probesize",
+        "100M",
+        "-show_format",
+        "-show_streams",
+        "-of",
+        "json",
+    ]
+    if skip_initial_bytes > 0:
+        command.extend(["-skip_initial_bytes", str(skip_initial_bytes)])
+    command.append(str(path))
+
     result = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-analyzeduration",
-            "100M",
-            "-probesize",
-            "100M",
-            "-show_format",
-            "-show_streams",
-            "-of",
-            "json",
-            str(path),
-        ],
+        command,
         text=True,
         capture_output=True,
     )
@@ -130,6 +143,85 @@ def run_probe(ffprobe: str, path: Path) -> dict[str, Any]:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"ffprobe returned invalid JSON: {exc}") from exc
+
+
+def audio_is_usable(stream: dict[str, Any] | None) -> bool:
+    if not stream or not stream.get("codec_name"):
+        return False
+    try:
+        sample_rate = int(stream.get("sample_rate") or 0)
+        channels = int(stream.get("channels") or 0)
+    except (TypeError, ValueError):
+        return False
+    return sample_rate > 0 and channels > 0
+
+
+def find_mpeg_ps_start_offset(path: Path, max_scan_bytes: int = 4 * 1024 * 1024) -> int:
+    pattern = b"\x00\x00\x01\xba"
+    chunk_size = 1024 * 1024
+    overlap = len(pattern) - 1
+    offset = 0
+    carry = b""
+
+    with path.open("rb") as file:
+        while offset < max_scan_bytes:
+            read_size = min(chunk_size, max_scan_bytes - offset)
+            data = file.read(read_size)
+            if not data:
+                break
+            block = carry + data
+            start = 0
+            while True:
+                index = block.find(pattern, start)
+                if index < 0:
+                    break
+                absolute = offset - len(carry) + index
+                next_byte_index = index + len(pattern)
+                if next_byte_index < len(block) and block[next_byte_index] & 0xC0 == 0x40:
+                    return absolute
+                start = index + 1
+            carry = block[-overlap:]
+            offset += len(data)
+
+    return 0
+
+
+def probe_media(ffprobe: str, path: Path) -> MediaInfo:
+    base_probe = run_probe(ffprobe, path)
+    base_info = MediaInfo(path=path, probe=base_probe)
+    if base_info.has_valid_video:
+        return base_info
+
+    skip_bytes = find_mpeg_ps_start_offset(path)
+    if skip_bytes <= 0:
+        return base_info
+
+    try:
+        skipped_probe = run_probe(ffprobe, path, skip_initial_bytes=skip_bytes)
+    except RuntimeError:
+        return base_info
+
+    skipped_info = MediaInfo(
+        path=path,
+        probe=skipped_probe,
+        input_skip_bytes=skip_bytes,
+    )
+    if not skipped_info.has_valid_video:
+        return base_info
+
+    base_audio = base_info.audio
+    skipped_audio = skipped_info.audio
+    if (
+        audio_is_usable(base_audio)
+        and (
+            not audio_is_usable(skipped_audio)
+            or base_audio.get("codec_name") == "pcm_alaw"
+        )
+    ):
+        skipped_info.use_unskipped_audio = True
+        skipped_info.unskipped_audio = base_audio
+
+    return skipped_info
 
 
 def iter_media_files(root: Path, output_dir: Path) -> list[Path]:
@@ -163,13 +255,18 @@ def build_ffmpeg_command(
     audio_bitrate: str,
     overwrite: bool,
     has_audio: bool,
+    input_skip_bytes: int = 0,
+    use_unskipped_audio: bool = False,
+    progress: bool = False,
 ) -> list[str]:
-    filters = ["[0:v:0]setpts=PTS-STARTPTS,format=yuv420p[v]"]
+    video_input = "1:v:0" if use_unskipped_audio else "0:v:0"
+    audio_input = "0:a:0"
+    filters = [f"[{video_input}]setpts=PTS-STARTPTS,format=yuv420p[v]"]
     maps = ["-map", "[v]"]
 
     if has_audio:
         filters.append(
-            "[0:a:0]asetpts=PTS-STARTPTS,"
+            f"[{audio_input}]asetpts=PTS-STARTPTS,"
             "aresample=async=1:first_pts=0[a]"
         )
         maps.extend(["-map", "[a]"])
@@ -178,37 +275,67 @@ def build_ffmpeg_command(
         ffmpeg,
         "-hide_banner",
         "-loglevel",
-        "error",
-        "-stats",
-        "-y" if overwrite else "-n",
-        "-fflags",
-        "+genpts",
-        "-analyzeduration",
-        "100M",
-        "-probesize",
-        "100M",
-        "-i",
-        str(source),
-        "-filter_complex",
-        ";".join(filters),
-        *maps,
-        "-map_metadata",
-        "-1",
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        str(crf),
-        "-profile:v",
-        "high",
-        "-level:v",
-        "5.1",
-        "-pix_fmt",
-        "yuv420p",
-        "-tag:v",
-        "avc1",
+        "fatal",
     ]
+    if progress:
+        cmd.extend(["-nostats", "-progress", "pipe:1"])
+    else:
+        cmd.append("-stats")
+    cmd.extend(
+        [
+            "-y" if overwrite else "-n",
+        ]
+    )
+
+    def add_input(skip_bytes: int) -> None:
+        cmd.extend(
+            [
+                "-fflags",
+                "+genpts",
+                "-analyzeduration",
+                "100M",
+                "-probesize",
+                "100M",
+            ]
+        )
+        if skip_bytes > 0:
+            cmd.extend(["-skip_initial_bytes", str(skip_bytes)])
+        cmd.extend(
+            [
+                "-i",
+                str(source),
+            ]
+        )
+
+    if use_unskipped_audio:
+        add_input(0)
+        add_input(input_skip_bytes)
+    else:
+        add_input(input_skip_bytes)
+
+    cmd.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            *maps,
+            "-map_metadata",
+            "-1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-profile:v",
+            "high",
+            "-level:v",
+            "5.1",
+            "-pix_fmt",
+            "yuv420p",
+            "-tag:v",
+            "avc1",
+        ]
+    )
 
     if has_audio:
         cmd.extend(
@@ -254,6 +381,8 @@ def convert_one(
         audio_bitrate=args.audio_bitrate,
         overwrite=args.force,
         has_audio=info.audio is not None,
+        input_skip_bytes=info.input_skip_bytes,
+        use_unskipped_audio=info.use_unskipped_audio,
     )
 
     print(f"\nConverting: {source}")
@@ -373,7 +502,7 @@ def main() -> int:
     print(f"Scanning {len(files)} media file(s) under {root}")
     for source in files:
         try:
-            info = MediaInfo(path=source, probe=run_probe(ffprobe, source))
+            info = probe_media(ffprobe, source)
         except RuntimeError as exc:
             print(f"\nSkipping unreadable file: {source}")
             print(f"Reason: {exc}")
