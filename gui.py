@@ -56,6 +56,18 @@ def parse_ffmpeg_time(value: str) -> float | None:
         return None
 
 
+def parse_progress_seconds(key: str, value: str) -> float | None:
+    if key == "out_time":
+        return parse_ffmpeg_time(value)
+    if key in {"out_time_ms", "out_time_us"}:
+        try:
+            microseconds = int(value.strip())
+        except (ValueError, AttributeError):
+            return None
+        return microseconds / 1_000_000
+    return None
+
+
 def media_duration(info: converter.MediaInfo) -> float:
     for stream in (info.video, info.audio, info.probe.get("format", {})):
         if not stream:
@@ -348,6 +360,26 @@ class ConverterApp:
             use_unskipped_audio=info.use_unskipped_audio,
             progress=True,
         )
+        return_code = self._run_ffmpeg_process(
+            cmd=cmd,
+            duration=duration,
+            file_index=file_index,
+            total=total,
+            target=target,
+        )
+        if return_code != 0:
+            raise RuntimeError(f"ffmpeg 转换失败，退出码：{return_code}")
+        verify = converter.validate_output(ffprobe, target)
+        self._put_log(f"已验证：{verify}")
+
+    def _run_ffmpeg_process(
+        self,
+        cmd: list[str],
+        duration: float,
+        file_index: int,
+        total: int,
+        target: Path,
+    ) -> int:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -367,8 +399,8 @@ class ConverterApp:
                 self._put_log(line)
                 continue
             key, value = line.split("=", 1)
-            if key == "out_time":
-                seconds = parse_ffmpeg_time(value)
+            if key in {"out_time", "out_time_ms", "out_time_us"}:
+                seconds = parse_progress_seconds(key, value)
                 if seconds is not None:
                     file_percent = min(max(seconds / duration, 0.0), 1.0)
                     overall = ((file_index + file_percent) / total) * 100
@@ -380,11 +412,7 @@ class ConverterApp:
 
         return_code = process.wait()
         self.current_process = None
-        if return_code != 0:
-            raise RuntimeError(f"ffmpeg 转换失败，退出码：{return_code}")
-
-        verify = converter.validate_output(ffprobe, target)
-        self._put_log(f"已验证：{verify}")
+        return return_code
 
     def _check_cancelled(self, process: subprocess.Popen[str] | None = None) -> None:
         if not self.cancel_event.is_set():
