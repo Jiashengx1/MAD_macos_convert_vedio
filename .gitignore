@@ -7,3 +7,8 @@ build
 dist
 *.spec
 .pyinstaller-cache
+copy_mp4_test_output
+converted_main_test
+elementary_copy_test_output
+setts_copy_test_output
+vendor

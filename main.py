@@ -6,9 +6,9 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -24,27 +24,25 @@ MEDIA_EXTENSIONS = {
     ".ts",
 }
 
-OUTPUT_WIDTH = 1920
-OUTPUT_HEIGHT = 1080
+COPYABLE_VIDEO_CODECS = {"h264", "hevc"}
 
 QUICK_PROBE_ANALYZE_DURATION = "5M"
 QUICK_PROBE_SIZE = "5M"
 DEEP_PROBE_ANALYZE_DURATION = "100M"
 DEEP_PROBE_SIZE = "100M"
 
-HARDWARE_VIDEO_ENCODER = "h264_videotoolbox"
-SOFTWARE_VIDEO_ENCODER = "libx264"
-
 DEFAULT_AUDIO_BITRATE = "16k"
-DEFAULT_HARDWARE_QUALITY = 40
+DEFAULT_AUDIO_RATE = "16000"
+DEFAULT_VIDEO_RATE = "25"
 DEFAULT_PROBE_WORKERS = 8
+VIDEO_TIMESCALE = 90000
 
 
 @dataclass(frozen=True)
 class ConversionPlan:
     name: str
     reason: str
-    mode: str  # "copy", "copy_video_transcode_audio", "full_transcode"
+    mode: str
 
 
 @dataclass
@@ -256,7 +254,6 @@ def probe_media(ffprobe: str, path: Path) -> MediaInfo:
     if base_info.has_valid_video:
         return base_info
 
-    # Some camera exports have junk bytes before the MPEG-PS pack header.
     skip_bytes = find_mpeg_ps_start_offset(path)
     if skip_bytes <= 0:
         return base_info
@@ -278,8 +275,6 @@ def probe_media(ffprobe: str, path: Path) -> MediaInfo:
     if not skipped_info.has_valid_video:
         return base_info
 
-    # In a few broken files, video is only readable after skipping junk bytes,
-    # while audio is only readable from the original input.
     base_audio = base_info.audio
     skipped_audio = skipped_info.audio
     if (
@@ -342,175 +337,89 @@ def output_path_for(input_path: Path, root: Path, output_dir: Path) -> Path:
     return output_dir / relative.parent / f"{relative.stem}_macos.mp4"
 
 
-def is_video_copy_compatible(info: MediaInfo) -> bool:
-    video = info.video or {}
-    return (
-        video.get("codec_name") == "h264"
-        and int(video.get("width") or 0) == OUTPUT_WIDTH
-        and int(video.get("height") or 0) == OUTPUT_HEIGHT
-        and video.get("pix_fmt") in {None, "yuv420p"}
-    )
+def frame_duration_ticks(video_rate: str) -> int:
+    try:
+        rate = Fraction(video_rate)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid video rate: {video_rate}") from exc
 
+    if rate <= 0:
+        raise RuntimeError(f"Video rate must be positive: {video_rate}")
 
-def is_audio_copy_compatible(info: MediaInfo) -> bool:
-    audio = info.audio
-    if audio is None:
-        return True
-    return audio.get("codec_name") == "aac"
-
-
-def has_safe_timestamps_for_copy(info: MediaInfo) -> bool:
-    gap = info.stream_start_gap
-    return (
-        info.input_skip_bytes <= 0
-        and not info.use_unskipped_audio
-        and (gap is None or gap <= 1.0)
-    )
-
-
-def is_already_macos_mp4(info: MediaInfo) -> bool:
-    return (
-        info.path.suffix.lower() == ".mp4"
-        and not info.is_mpeg_ps
-        and is_video_copy_compatible(info)
-        and is_audio_copy_compatible(info)
-        and has_safe_timestamps_for_copy(info)
-    )
+    ticks = Fraction(VIDEO_TIMESCALE, 1) / rate
+    if ticks.denominator != 1:
+        raise RuntimeError(
+            "Video rate must divide the 90000 Hz MP4 video timescale exactly; "
+            f"got {video_rate}. Try a rational value like 30000/1001."
+        )
+    return ticks.numerator
 
 
 def choose_conversion_plan(info: MediaInfo) -> ConversionPlan | None:
+    if not info.is_mpeg_ps:
+        return None
     if not info.has_valid_video:
         return None
 
-    if is_already_macos_mp4(info):
+    video = info.video or {}
+    video_codec = str(video.get("codec_name") or "")
+    if video_codec not in COPYABLE_VIDEO_CODECS:
         return None
 
-    if has_safe_timestamps_for_copy(info) and is_video_copy_compatible(info):
-        if is_audio_copy_compatible(info):
-            return ConversionPlan(
-                name="remux/copy",
-                reason="video and audio are already MP4-compatible; only remuxing",
-                mode="copy",
-            )
-
-        return ConversionPlan(
-            name="copy video + transcode audio",
-            reason="video is already H.264 1080p; only audio needs AAC conversion",
-            mode="copy_video_transcode_audio",
-        )
-
     return ConversionPlan(
-        name="full transcode",
-        reason="video size/codec/pixel format/timestamps require filtering or re-encoding",
-        mode="full_transcode",
+        name="copy video + rebuild MP4 timeline",
+        reason=(
+            "real container is MPEG-PS; H.264/HEVC video can be copied, "
+            "while packet timestamps and AAC audio are rebuilt"
+        ),
+        mode="setts_copy",
     )
 
 
-def h264_videotoolbox_available(ffmpeg: str) -> bool:
-    with tempfile.TemporaryDirectory() as temp_dir:
-        output = Path(temp_dir) / "videotoolbox_test.mp4"
-        command = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=1920x1080:rate=25",
-            "-t",
-            "0.2",
-            "-c:v",
-            HARDWARE_VIDEO_ENCODER,
-            "-q:v",
-            str(DEFAULT_HARDWARE_QUALITY),
-            "-profile:v",
-            "high",
-            "-level:v",
-            "5.1",
-            "-tag:v",
-            "avc1",
-            "-an",
-            str(output),
-        ]
+def skip_reason(info: MediaInfo) -> str:
+    if not info.is_mpeg_ps:
+        return "real container is not MPEG-PS"
+    if not info.has_valid_video:
+        return "ffprobe could not determine a usable video stream"
 
-        try:
-            result = subprocess.run(
-                command,
-                text=True,
-                capture_output=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-
-        return result.returncode == 0 and output.exists() and output.stat().st_size > 0
+    video = info.video or {}
+    video_codec = str(video.get("codec_name") or "")
+    if video_codec not in COPYABLE_VIDEO_CODECS:
+        return f"video codec is not H.264/HEVC: {video_codec or 'none'}"
+    return "no conversion plan"
 
 
-def describe_video_encoder(video_encoder: str) -> str:
-    if video_encoder == HARDWARE_VIDEO_ENCODER:
-        return HARDWARE_VIDEO_ENCODER
-    if video_encoder == SOFTWARE_VIDEO_ENCODER:
-        return SOFTWARE_VIDEO_ENCODER
-    return video_encoder
+def stream_duration(stream: dict[str, Any] | None) -> float | None:
+    if not stream:
+        return None
+    try:
+        duration = float(stream.get("duration"))
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
 
 
-def encoder_attempts(video_encoder: str, hardware_available: bool) -> list[str]:
-    if video_encoder == SOFTWARE_VIDEO_ENCODER:
-        return [SOFTWARE_VIDEO_ENCODER]
-    if video_encoder == HARDWARE_VIDEO_ENCODER:
-        return [HARDWARE_VIDEO_ENCODER, SOFTWARE_VIDEO_ENCODER]
-    if hardware_available:
-        return [HARDWARE_VIDEO_ENCODER, SOFTWARE_VIDEO_ENCODER]
-    return [SOFTWARE_VIDEO_ENCODER]
+def estimate_duration(info: MediaInfo, video_rate: str = DEFAULT_VIDEO_RATE) -> float:
+    audio_duration = stream_duration(info.audio)
+    if audio_duration:
+        return audio_duration
 
+    video = info.video or {}
+    try:
+        frame_count = int(video.get("nb_frames") or 0)
+        rate = float(Fraction(video_rate))
+    except (TypeError, ValueError, ZeroDivisionError):
+        frame_count = 0
+        rate = 0.0
+    if frame_count > 0 and rate > 0:
+        return frame_count / rate
 
-def video_encoder_options(
-    video_encoder: str,
-    crf: int,
-    preset: str,
-    hardware_quality: int,
-    video_bitrate: str | None,
-) -> list[str]:
-    if video_encoder == HARDWARE_VIDEO_ENCODER:
-        options = [
-            "-c:v",
-            HARDWARE_VIDEO_ENCODER,
-        ]
-        if video_bitrate:
-            options.extend(["-b:v", video_bitrate])
-        else:
-            options.extend(["-q:v", str(hardware_quality)])
+    for stream in (info.probe.get("format", {}), info.video):
+        duration = stream_duration(stream)
+        if duration and duration < 24 * 3600:
+            return duration
 
-        options.extend(
-            [
-                "-profile:v",
-                "high",
-                "-level:v",
-                "5.1",
-                "-tag:v",
-                "avc1",
-            ]
-        )
-        return options
-
-    return [
-        "-c:v",
-        SOFTWARE_VIDEO_ENCODER,
-        "-preset",
-        preset,
-        "-crf",
-        str(crf),
-        "-profile:v",
-        "high",
-        "-level:v",
-        "5.1",
-        "-pix_fmt",
-        "yuv420p",
-        "-tag:v",
-        "avc1",
-    ]
+    return 1.0
 
 
 def add_input_options(
@@ -533,18 +442,27 @@ def add_input_options(
     cmd.extend(["-i", str(source)])
 
 
-def add_common_output_options(cmd: list[str], target: Path, faststart: bool) -> None:
-    if faststart:
-        cmd.extend(["-movflags", "+faststart"])
-    cmd.extend(["-max_muxing_queue_size", "4096", str(target)])
+def add_inputs(command: list[str], source: Path, info: MediaInfo) -> tuple[str, str]:
+    if info.use_unskipped_audio:
+        add_input_options(command, source, skip_initial_bytes=0)
+        add_input_options(command, source, skip_initial_bytes=info.input_skip_bytes)
+        return "1:v:0", "0:a:0?"
+
+    add_input_options(command, source, skip_initial_bytes=info.input_skip_bytes)
+    return "0:v:0", "0:a:0?"
 
 
-def ffmpeg_command_prefix(ffmpeg: str, overwrite: bool, *, progress: bool = False) -> list[str]:
+def ffmpeg_command_prefix(
+    ffmpeg: str,
+    overwrite: bool,
+    *,
+    progress: bool = False,
+) -> list[str]:
     cmd = [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
-        "fatal",
+        "error",
     ]
     if progress:
         cmd.extend(["-nostats", "-progress", "pipe:1"])
@@ -554,27 +472,28 @@ def ffmpeg_command_prefix(ffmpeg: str, overwrite: bool, *, progress: bool = Fals
     return cmd
 
 
-def build_copy_command(
+def build_conversion_command(
     ffmpeg: str,
     source: Path,
     target: Path,
     info: MediaInfo,
     args: argparse.Namespace,
     *,
-    transcode_audio: bool,
     overwrite: bool,
     progress: bool = False,
 ) -> list[str]:
-    cmd = ffmpeg_command_prefix(ffmpeg, overwrite, progress=progress)
+    video = info.video or {}
+    audio = info.audio
+    video_codec = str(video.get("codec_name") or "")
+    audio_codec = str(audio.get("codec_name") or "") if audio else ""
 
-    add_input_options(cmd, source)
+    command = ffmpeg_command_prefix(ffmpeg, overwrite, progress=progress)
+    video_map, audio_map = add_inputs(command, source, info)
 
-    cmd.extend(
+    command.extend(
         [
             "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
+            video_map,
             "-map_metadata",
             "-1",
             "-c:v",
@@ -582,103 +501,65 @@ def build_copy_command(
         ]
     )
 
-    if info.audio is not None:
-        if transcode_audio:
-            cmd.extend(
+    if args.video_mode == "setts":
+        ticks = frame_duration_ticks(str(args.video_rate))
+        command.extend(
+            [
+                "-bsf:v",
+                f"setts=ts=N*{ticks}:duration={ticks}:time_base=1/{VIDEO_TIMESCALE}",
+            ]
+        )
+
+    if video_codec == "h264":
+        command.extend(["-tag:v", "avc1"])
+    elif video_codec == "hevc":
+        command.extend(["-tag:v", "hvc1"])
+
+    if audio:
+        command.extend(["-map", audio_map])
+        if args.audio_mode == "copy-aac" and audio_codec == "aac":
+            command.extend(["-c:a", "copy"])
+        else:
+            if args.audio_mode == "async":
+                audio_filter = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+            else:
+                audio_filter = f"aresample={args.audio_rate},asetpts=N/SR/TB"
+
+            command.extend(
                 [
-                    "-af",
-                    "aresample=async=1:first_pts=0",
+                    "-filter:a",
+                    audio_filter,
                     "-c:a",
                     "aac",
                     "-b:a",
                     args.audio_bitrate,
                     "-ar",
-                    "48000",
+                    str(args.audio_rate),
                     "-ac",
                     "1",
                 ]
             )
-        else:
-            cmd.extend(["-c:a", "copy"])
 
-    add_common_output_options(cmd, target, faststart=not args.no_faststart)
-    return cmd
-
-
-def build_full_transcode_command(
-    ffmpeg: str,
-    source: Path,
-    target: Path,
-    info: MediaInfo,
-    args: argparse.Namespace,
-    *,
-    video_encoder: str,
-    overwrite: bool,
-    progress: bool = False,
-) -> list[str]:
-    has_audio = info.audio is not None
-    video_input = "1:v:0" if info.use_unskipped_audio else "0:v:0"
-    audio_input = "0:a:0"
-
-    video_filter = (
-        f"[{video_input}]setpts=PTS-STARTPTS,"
-        f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
-        f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-        "setsar=1,format=yuv420p[v]"
-    )
-
-    filters = [video_filter]
-    maps = ["-map", "[v]"]
-
-    if has_audio:
-        filters.append(
-            f"[{audio_input}]asetpts=PTS-STARTPTS,"
-            "aresample=async=1:first_pts=0[a]"
-        )
-        maps.extend(["-map", "[a]"])
-
-    cmd = ffmpeg_command_prefix(ffmpeg, overwrite, progress=progress)
-
-    if info.use_unskipped_audio:
-        add_input_options(cmd, source, skip_initial_bytes=0)
-        add_input_options(cmd, source, skip_initial_bytes=info.input_skip_bytes)
-    else:
-        add_input_options(cmd, source, skip_initial_bytes=info.input_skip_bytes)
-
-    cmd.extend(
+    command.extend(
         [
-            "-filter_complex",
-            ";".join(filters),
-            *maps,
-            "-map_metadata",
-            "-1",
-            *video_encoder_options(
-                video_encoder=video_encoder,
-                crf=args.crf,
-                preset=args.preset,
-                hardware_quality=args.hardware_quality,
-                video_bitrate=args.video_bitrate,
-            ),
+            "-avoid_negative_ts",
+            "make_zero",
+            "-video_track_timescale",
+            str(VIDEO_TIMESCALE),
         ]
     )
-
-    if has_audio:
-        cmd.extend(
-            [
-                "-c:a",
-                "aac",
-                "-b:a",
-                args.audio_bitrate,
-                "-ar",
-                "48000",
-                "-ac",
-                "1",
-                "-shortest",
-            ]
-        )
-
-    add_common_output_options(cmd, target, faststart=not args.no_faststart)
-    return cmd
+    if not args.no_faststart:
+        command.extend(["-movflags", "+faststart"])
+    command.extend(
+        [
+            "-max_muxing_queue_size",
+            "4096",
+            "-f",
+            "mp4",
+            str(target),
+        ]
+    )
+    return command
 
 
 def run_command(command: list[str]) -> bool:
@@ -696,8 +577,28 @@ def remove_partial_output(path: Path) -> None:
     except FileNotFoundError:
         pass
     except OSError:
-        # If the file cannot be removed, ffmpeg with -y may still overwrite it.
         pass
+
+
+def validate_output(ffprobe: str, path: Path) -> str:
+    probe = run_probe(ffprobe, path)
+    info = MediaInfo(path=path, probe=probe)
+    format_name = info.format_name
+    video = info.video or {}
+    audio = info.audio or {}
+    if "mp4" not in format_name and "mov" not in format_name:
+        raise RuntimeError(f"output is not MP4/QuickTime: {format_name}")
+
+    return (
+        f"container={format_name}, "
+        f"video={video.get('codec_name', 'none')} "
+        f"{video.get('width', '-')}x{video.get('height', '-')}, "
+        f"video_duration={video.get('duration', '-')}, "
+        f"video_fps={video.get('avg_frame_rate', '-')}, "
+        f"audio={audio.get('codec_name', 'none')}, "
+        f"audio_duration={audio.get('duration', '-')}, "
+        f"start={probe.get('format', {}).get('start_time', '-')}"
+    )
 
 
 def convert_one(
@@ -709,97 +610,37 @@ def convert_one(
     args: argparse.Namespace,
 ) -> bool:
     target.parent.mkdir(parents=True, exist_ok=True)
-    encoders = encoder_attempts(args.video_encoder, args.hardware_encoder_available)
+    command = build_conversion_command(
+        ffmpeg=ffmpeg,
+        source=source,
+        target=target,
+        info=info,
+        args=args,
+        overwrite=args.force,
+    )
 
     print(f"\nConverting: {source}")
     print(f"Output:     {target}")
     print(f"Plan:       {plan.name} ({plan.reason})")
 
-    if plan.mode in {"copy", "copy_video_transcode_audio"}:
-        transcode_audio = plan.mode == "copy_video_transcode_audio"
-        copy_cmd = build_copy_command(
-            ffmpeg=ffmpeg,
-            source=source,
-            target=target,
-            info=info,
-            args=args,
-            transcode_audio=transcode_audio,
-            overwrite=args.force,
-        )
-
-        if args.dry_run:
-            print("Dry run command:")
-            print_command(copy_cmd)
-            return True
-
-        if run_command(copy_cmd):
-            return True
-
-        print(
-            "Copy/remux path failed; retrying with full transcode.",
-            file=sys.stderr,
-        )
-        remove_partial_output(target)
-
     if args.dry_run:
-        for index, video_encoder in enumerate(encoders):
-            cmd = build_full_transcode_command(
-                ffmpeg=ffmpeg,
-                source=source,
-                target=target,
-                info=info,
-                args=args,
-                video_encoder=video_encoder,
-                overwrite=args.force or index > 0,
-            )
-            print(f"Dry run command ({describe_video_encoder(video_encoder)}):")
-            print_command(cmd)
+        print("Dry run command:")
+        print_command(command)
         return True
 
-    for index, video_encoder in enumerate(encoders):
-        print(f"Encoder: {describe_video_encoder(video_encoder)}")
-        cmd = build_full_transcode_command(
-            ffmpeg=ffmpeg,
-            source=source,
-            target=target,
-            info=info,
-            args=args,
-            video_encoder=video_encoder,
-            overwrite=args.force or index > 0 or plan.mode != "full_transcode",
-        )
+    if run_command(command):
+        return True
 
-        if run_command(cmd):
-            return True
-
-        print(
-            f"FAILED with {describe_video_encoder(video_encoder)}: "
-            "ffmpeg exited with a non-zero status.",
-            file=sys.stderr,
-        )
-        remove_partial_output(target)
-
-        if index < len(encoders) - 1:
-            print("Retrying with libx264 CPU fallback.")
-
+    remove_partial_output(target)
     return False
-
-
-def validate_output(ffprobe: str, path: Path) -> str:
-    probe = run_probe(ffprobe, path)
-    info = MediaInfo(path=path, probe=probe)
-    video = info.video or {}
-    audio = info.audio or {}
-    video_start = video.get("start_time", "unknown")
-    audio_start = audio.get("start_time", "none")
-    return (
-        f"{info.summary()}, "
-        f"video_start={video_start}, audio_start={audio_start}"
-    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert camera/video exports into macOS-compatible MP4 files."
+        description=(
+            "Convert broken MPEG-PS camera exports into standard MP4 by copying "
+            "H.264/HEVC video, rebuilding video timestamps, and writing AAC audio."
+        )
     )
     parser.add_argument(
         "input",
@@ -837,54 +678,41 @@ def parse_args() -> argparse.Namespace:
         "--probe-workers",
         type=int,
         default=DEFAULT_PROBE_WORKERS,
+        help=f"Number of concurrent ffprobe workers. Default: {DEFAULT_PROBE_WORKERS}.",
+    )
+    parser.add_argument(
+        "--video-mode",
+        choices=("setts", "direct"),
+        default="setts",
         help=(
-            "Number of concurrent ffprobe workers. "
-            f"Default: {DEFAULT_PROBE_WORKERS}. "
-            "Use 2-4 for external drives; 4-8 for fast internal SSDs."
+            "setts rebuilds video packet timestamps at --video-rate while "
+            "copying video; direct preserves source timestamps. Default: setts."
         ),
     )
     parser.add_argument(
-        "--crf",
-        type=int,
-        default=23,
-        help="libx264 quality. Lower is larger/better. Default: 23.",
+        "--video-rate",
+        default=DEFAULT_VIDEO_RATE,
+        help=f"Frame rate used by --video-mode setts. Default: {DEFAULT_VIDEO_RATE}.",
     )
     parser.add_argument(
-        "--preset",
-        default="veryfast",
-        help="libx264 preset. Default: veryfast.",
-    )
-    parser.add_argument(
-        "--video-encoder",
-        choices=(HARDWARE_VIDEO_ENCODER, SOFTWARE_VIDEO_ENCODER),
-        default=HARDWARE_VIDEO_ENCODER,
+        "--audio-mode",
+        choices=("rebuild", "async", "copy-aac"),
+        default="rebuild",
         help=(
-            f"Video encoder for full transcode. Default: {HARDWARE_VIDEO_ENCODER}. "
-            "h264_videotoolbox falls back to libx264 if hardware encoding fails."
-        ),
-    )
-    parser.add_argument(
-        "--hardware-quality",
-        type=int,
-        default=DEFAULT_HARDWARE_QUALITY,
-        help=(
-            "h264_videotoolbox quality, 0-100, higher is better. "
-            f"Default: {DEFAULT_HARDWARE_QUALITY}. "
-            "Ignored when --video-bitrate is set."
-        ),
-    )
-    parser.add_argument(
-        "--video-bitrate",
-        default=None,
-        help=(
-            "Use bitrate mode for h264_videotoolbox, e.g. 5000k. "
-            "If omitted, h264_videotoolbox uses --hardware-quality."
+            "Audio handling. rebuild reconstructs audio timestamps from sample "
+            "count; async uses ffmpeg async resampling; copy-aac copies AAC and "
+            "transcodes non-AAC. Default: rebuild."
         ),
     )
     parser.add_argument(
         "--audio-bitrate",
         default=DEFAULT_AUDIO_BITRATE,
         help=f"AAC audio bitrate. Default: {DEFAULT_AUDIO_BITRATE}.",
+    )
+    parser.add_argument(
+        "--audio-rate",
+        default=DEFAULT_AUDIO_RATE,
+        help=f"AAC output sample rate. Default: {DEFAULT_AUDIO_RATE}.",
     )
     return parser.parse_args()
 
@@ -896,6 +724,11 @@ def main() -> int:
         pass
 
     args = parse_args()
+    try:
+        frame_duration_ticks(str(args.video_rate))
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     try:
         ffmpeg = require_tool("ffmpeg")
@@ -903,20 +736,6 @@ def main() -> int:
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-
-    args.hardware_encoder_available = False
-    if args.video_encoder == HARDWARE_VIDEO_ENCODER:
-        args.hardware_encoder_available = h264_videotoolbox_available(ffmpeg)
-        if args.hardware_encoder_available:
-            print("Hardware encoder available: h264_videotoolbox")
-        else:
-            print(
-                "Warning: h264_videotoolbox preflight failed; "
-                "conversion will try it and then fall back to libx264 if needed."
-            )
-            args.hardware_encoder_available = True
-    else:
-        print("Using libx264.")
 
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
@@ -954,17 +773,9 @@ def main() -> int:
         print(f"\nFound: {source}")
         print(f"Probe: {info.summary()}")
 
-        if not info.has_valid_video:
-            print(
-                "Skip: ffprobe could not determine a usable video size; "
-                "the file is probably damaged or exported in an unsupported variant."
-            )
-            skipped += 1
-            continue
-
         plan = choose_conversion_plan(info)
         if plan is None:
-            print("Skip: already looks like a macOS-compatible MP4 for this script.")
+            print(f"Skip: {skip_reason(info)}")
             skipped += 1
             continue
 
@@ -982,6 +793,7 @@ def main() -> int:
                 except RuntimeError as exc:
                     print(f"Warning: conversion finished but validation failed: {exc}")
         else:
+            print("FAILED: ffmpeg exited with a non-zero status.", file=sys.stderr)
             failed += 1
 
     print(

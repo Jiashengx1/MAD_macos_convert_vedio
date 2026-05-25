@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 
 
-APP_NAME = "MacVideoConverter"
+APP_NAME = "医务科监控修复助手"
+VENDOR_FFMPEG_DIR = Path("vendor") / "ffmpeg-macos-arm64"
 
 
 def require_binary(name: str) -> Path:
@@ -16,6 +17,20 @@ def require_binary(name: str) -> Path:
     if not found:
         raise RuntimeError(f"找不到 {name}，请先安装 FFmpeg。")
     return Path(found).resolve()
+
+
+def bundled_binary(project_dir: Path, name: str) -> Path | None:
+    candidate = project_dir / VENDOR_FFMPEG_DIR / name
+    if candidate.exists():
+        return candidate.resolve()
+    return None
+
+
+def resolve_ffmpeg_binary(project_dir: Path, name: str) -> Path:
+    bundled = bundled_binary(project_dir, name)
+    if bundled is not None:
+        return bundled
+    return require_binary(name)
 
 
 def run(command: list[str], env: dict[str, str] | None = None) -> None:
@@ -31,11 +46,19 @@ def main() -> int:
         return 2
 
     try:
-        ffmpeg = require_binary("ffmpeg")
-        ffprobe = require_binary("ffprobe")
+        ffmpeg = resolve_ffmpeg_binary(project_dir, "ffmpeg")
+        ffprobe = resolve_ffmpeg_binary(project_dir, "ffprobe")
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    if ffmpeg.parent == project_dir / VENDOR_FFMPEG_DIR:
+        print(f"使用兼容版 FFmpeg：{ffmpeg.parent}")
+    else:
+        print(
+            "警告：未找到 vendor/ffmpeg-macos-arm64，"
+            "将使用本机 PATH 中的 FFmpeg；发给旧 macOS 可能不兼容。"
+        )
 
     pyinstaller_check = subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--version"],
