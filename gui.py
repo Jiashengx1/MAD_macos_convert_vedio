@@ -37,17 +37,26 @@ def bundled_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def tool_file_names(name: str) -> tuple[str, ...]:
+    if name.lower().endswith(".exe"):
+        return (name,)
+    return (name, f"{name}.exe")
+
+
 def find_tool(name: str) -> str:
     base = bundled_base_dir()
-    candidates = [
-        base / name,
-        Path(sys.executable).resolve().parent / name,
-        Path(sys.executable).resolve().parent.parent / "Resources" / name,
-        Path(sys.executable).resolve().parent.parent / "Frameworks" / name,
+    executable_dir = Path(sys.executable).resolve().parent
+    candidate_dirs = [
+        base,
+        executable_dir,
+        executable_dir.parent / "Resources",
+        executable_dir.parent / "Frameworks",
     ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
+    for directory in candidate_dirs:
+        for filename in tool_file_names(name):
+            candidate = directory / filename
+            if candidate.exists():
+                return str(candidate)
 
     found = shutil.which(name)
     if not found:

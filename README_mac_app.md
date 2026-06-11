@@ -1,5 +1,7 @@
 # macOS GUI 打包说明
 
+Windows 打包见 `README_windows_app.md`。
+
 ## 运行源码版
 
 ```bash
@@ -16,10 +18,10 @@ python3.12 build_macos_app.py
 
 生成结果：
 
-- `dist/MacVideoConverter.app`
-- `dist/MacVideoConverter-macos.zip`
+- `dist/医务科监控修复助手.app`
+- `dist/医务科监控修复助手-macos.zip`
 
-`.app` 内已包含 Python 运行时、GUI、`ffmpeg` 和 `ffprobe`。把 zip 发给别人，对方解压后双击 `MacVideoConverter.app` 即可。
+`.app` 内已包含 Python 运行时、GUI、`ffmpeg` 和 `ffprobe`。把 zip 发给别人，对方解压后双击 `医务科监控修复助手.app` 即可。
 
 转换输出为标准 MP4：视频保持原始 H.264/HEVC 码流并重建 MP4 时间戳，音频输出为 AAC。这个版本不再使用 `h264_videotoolbox` 或 `libx264` 重新编码视频，因此不会强制缩放到 1920x1080。
 
